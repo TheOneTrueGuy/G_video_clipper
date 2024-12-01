@@ -1,11 +1,81 @@
+"""
+Video Keyword Finder
+==================
+
+A Python script that finds and timestamps specific keywords within video files.
+It transcribes the audio using Whisper AI and finds all occurrences of specified keywords
+with their timestamps and surrounding context. Supports both local video files and YouTube URLs.
+
+Requirements
+-----------
+- Python 3.8 or higher
+- ffmpeg (must be installed and accessible in system PATH)
+- GPU recommended but not required
+
+Installation
+-----------
+1. Create and activate a virtual environment:
+   ```
+   python -m venv venv
+   venv\Scripts\activate  # On Windows
+   source venv/bin/activate  # On Unix/MacOS
+   ```
+
+2. Install required packages:
+   ```
+   pip install yt-dlp whisper-timestamped torch ffmpeg-python
+   ```
+
+3. Download the Whisper model (happens automatically on first run)
+
+Usage Examples
+-------------
+1. Search keywords in a local video file:
+   ```
+   python keyword_finder.py path/to/video.mp4 -k search_term
+   ```
+
+2. Search with multiple keywords and time range:
+   ```
+   python keyword_finder.py video.mp4 -k keyword1 keyword2 -b 0:00 -e 10:00
+   ```
+
+3. Search in a YouTube video:
+   ```
+   python keyword_finder.py https://www.youtube.com/watch?v=VIDEO_ID -k word1 word2
+   ```
+
+Output
+------
+- Generates 'timestamps.txt' with all keyword occurrences and their context
+- Creates a detailed log file 'keyword_finder.log'
+- Shows progress in console during processing
+
+Note: Processing time depends on video length and system capabilities.
+      A 1-hour video typically takes 15-30 minutes to process.
+"""
+
 import argparse
 import whisper_timestamped as whisper
-from moviepy.video.io.VideoFileClip import VideoFileClip
 import datetime
 import os
 import tempfile
 import yt_dlp
 import re
+import logging
+import math
+import subprocess
+import glob
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('keyword_finder.log'),
+        logging.StreamHandler()
+    ]
+)
 
 def parse_time(time_str):
     """Convert time string (HH:MM:SS) to seconds"""
@@ -42,68 +112,156 @@ def download_youtube_video(url):
     ydl_opts = {
         'format': 'best[ext=mp4]',
         'outtmpl': temp_file,
-        'quiet': True
+        'quiet': False,
+        'progress_hooks': [lambda d: logging.info(f"Download progress: {d.get('status', 'unknown')}")],
+        'socket_timeout': 30,
     }
     
     try:
+        logging.info(f"Starting download of YouTube video: {url}")
+        print("Downloading video... This may take a few minutes.")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return temp_file
+            info = ydl.extract_info(url, download=True)
+            logging.info(f"Video info extracted: {info.get('title', 'Unknown title')}")
+        
+        if os.path.exists(temp_file):
+            file_size = os.path.getsize(temp_file)
+            logging.info(f"Download complete. File size: {file_size / (1024*1024):.2f} MB")
+            return temp_file
+        else:
+            raise Exception("Download completed but file not found")
     except Exception as e:
-        raise Exception(f"Error downloading YouTube video: {str(e)}")
+        logging.error(f"Error downloading YouTube video: {str(e)}")
+        raise
+
+def get_video_duration(video_path):
+    """Get video duration using ffprobe"""
+    cmd = [
+        'ffprobe', 
+        '-v', 'error', 
+        '-show_entries', 'format=duration', 
+        '-of', 'default=noprint_wrappers=1:nokey=1', 
+        video_path
+    ]
+    try:
+        output = subprocess.check_output(cmd).decode().strip()
+        return float(output)
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Error getting video duration: {str(e)}")
+        raise
+
+def split_video(video_path, segment_duration=120):
+    """Split video into segments using ffmpeg"""
+    try:
+        temp_dir = tempfile.gettempdir()
+        segment_pattern = os.path.join(temp_dir, 'segment_%03d.mp4')
+        
+        # Remove any existing segments
+        for old_segment in glob.glob(os.path.join(temp_dir, 'segment_*.mp4')):
+            try:
+                os.remove(old_segment)
+            except:
+                pass
+        
+        # Split video into segments
+        cmd = [
+            'ffmpeg',
+            '-i', video_path,
+            '-f', 'segment',
+            '-segment_time', str(segment_duration),
+            '-c', 'copy',
+            '-reset_timestamps', '1',
+            segment_pattern
+        ]
+        
+        logging.info("Splitting video into segments...")
+        subprocess.run(cmd, check=True, capture_output=True)
+        
+        # Get list of generated segments
+        segments = sorted(glob.glob(os.path.join(temp_dir, 'segment_*.mp4')))
+        logging.info(f"Created {len(segments)} segments")
+        
+        return segments
+        
+    except Exception as e:
+        logging.error(f"Error splitting video: {str(e)}")
+        raise
+
+def process_segments(segments, keywords):
+    """Process each segment sequentially"""
+    results = {keyword: [] for keyword in keywords}
+    
+    # Load whisper model once
+    logging.info("Loading Whisper model...")
+    model = whisper.load_model("base")
+    
+    for i, segment_path in enumerate(segments):
+        try:
+            segment_num = int(re.search(r'segment_(\d+)', segment_path).group(1))
+            start_time = segment_num * 120  # Each segment is 120 seconds
+            
+            logging.info(f"Processing segment {i+1}/{len(segments)} (starting at {format_time(start_time)})")
+            
+            # Transcribe segment
+            audio = whisper.load_audio(segment_path)
+            transcription = whisper.transcribe(model, audio)
+            
+            # Process results
+            for segment in transcription['segments']:
+                text = segment['text'].lower()
+                timestamp = segment['start'] + start_time  # Adjust timestamp relative to full video
+                
+                for keyword in keywords:
+                    if keyword.lower() in text:
+                        results[keyword].append({
+                            'timestamp': timestamp,
+                            'text': segment['text']
+                        })
+                        logging.info(f"Found keyword '{keyword}' at {timestamp:.2f}s: {segment['text']}")
+            
+        except Exception as e:
+            logging.error(f"Error processing segment {segment_path}: {str(e)}")
+            continue
+            
+        finally:
+            # Clean up segment file
+            try:
+                os.remove(segment_path)
+            except:
+                pass
+    
+    return results
 
 def find_keywords_in_video(video_path, keywords, begin_time=None, end_time=None):
     """Find timestamps for keywords in video transcription"""
     try:
-        # Load the model and transcribe
-        model = whisper.load_model("base")
-        audio = whisper.load_audio(video_path)
+        logging.info(f"Processing video: {video_path}")
+        logging.info(f"Searching for keywords: {keywords}")
         
-        # Get video duration if end_time is None
-        if end_time is None:
-            try:
-                with VideoFileClip(video_path) as video:
-                    end_time = video.duration
-            except Exception as e:
-                print(f"Warning: Could not get video duration: {str(e)}")
-                end_time = float('inf')  # Use infinite duration as fallback
-
-        # Convert begin_time to 0 if None
-        begin_time = begin_time or 0
+        # Convert keywords string to list and clean up
+        if isinstance(keywords, str):
+            keywords = [k.strip() for k in keywords.split(',')]
         
-        # Transcribe the audio
-        try:
-            result = whisper.transcribe(model, audio, language="en")
-        except Exception as e:
-            print(f"Error during transcription: {str(e)}")
-            return {}
+        # Get video duration
+        duration = get_video_duration(video_path)
+        logging.info(f"Video duration: {duration:.2f} seconds")
         
-        # Process keywords and create results dictionary
-        keyword_list = [k.strip().lower() for k in keywords.split(',') if k.strip()]  # Skip empty keywords
-        if not keyword_list:
-            print("Warning: No valid keywords provided")
-            return {}
-            
-        results = {keyword: [] for keyword in keyword_list}
+        # Set time bounds
+        start = begin_time if begin_time is not None else 0
+        end = min(end_time if end_time is not None else duration, duration)
         
-        # Search through segments
-        for segment in result.get("segments", []):
-            # Skip if segment is outside our time range
-            if segment["start"] < begin_time or segment["end"] > end_time:
-                continue
-                
-            text = segment["text"].lower()
-            for keyword in keyword_list:
-                if keyword in text:
-                    results[keyword].append({
-                        "timestamp": segment["start"],
-                        "text": segment["text"].strip()
-                    })
+        # Split video into segments
+        segment_duration = 120  # 2 minutes per segment
+        segments = split_video(video_path, segment_duration)
+        
+        # Process segments sequentially
+        results = process_segments(segments, keywords)
         
         return results
+        
     except Exception as e:
-        print(f"Error processing video: {str(e)}")
-        return {}
+        logging.error(f"Error processing video: {str(e)}")
+        raise
 
 def main():
     try:
